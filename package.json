@@ -1,0 +1,26 @@
+{
+  "name": "video-skill-pro",
+  "version": "3.0.0",
+  "description": "视频内容解析 MCP Server Pro - 支持 FFmpeg/Whisper/faster-whisper 完整功能（优化版）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node server.js"
+  },
+  "keywords": [
+    "video",
+    "mcp",
+    "claude",
+    "ffmpeg",
+    "whisper",
+    "subtitle",
+    "transcription"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12"
+  }
+}
