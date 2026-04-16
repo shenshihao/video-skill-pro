@@ -261,13 +261,18 @@ const TOOLS = [
   },
   {
     name: 'analyze_bilibili',
-    description: '分析 B 站视频，提取标题、简介、弹幕、评论等',
+    description: '分析 B 站视频，提取标题、简介、弹幕、评论等（使用 B站官方 API）',
     inputSchema: {
       type: 'object',
       properties: {
         url: {
           type: 'string',
           description: 'B 站视频 URL',
+        },
+        include_danmaku: {
+          type: 'boolean',
+          description: '是否包含弹幕列表',
+          default: false,
         },
       },
       required: ['url'],
@@ -282,6 +287,30 @@ const TOOLS = [
         url: {
           type: 'string',
           description: 'YouTube 视频 URL',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'analyze_online_video',
+    description: '分析在线视频（支持 B站/YouTube 等），提取元数据、字幕、文字等',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: '在线视频 URL（B站、YouTube 等）',
+        },
+        options: {
+          type: 'object',
+          description: '分析选项',
+          properties: {
+            extract_metadata: { type: 'boolean', description: '是否提取元数据', default: true },
+            extract_subtitles: { type: 'boolean', description: '是否提取字幕', default: true },
+            video_to_text: { type: 'boolean', description: '是否转写为文字', default: false },
+            language: { type: 'string', description: '语音语言', default: 'zh' },
+          },
         },
       },
       required: ['url'],
@@ -332,7 +361,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       
       case 'analyze_youtube':
         return await analyzeYoutube(args.url);
-      
+
+      case 'analyze_online_video':
+        return await analyzeOnlineVideo(args.url, args.options);
+
       default:
         throw new Error(`未知工具：${name}`);
     }
@@ -924,17 +956,92 @@ async function extractAudio(videoPath, outputPath = null, format = 'mp3') {
 /**
  * 分析 B 站视频
  */
-async function analyzeBilibili(url) {
+async function analyzeBilibili(url, includeDanmaku = false) {
+  // 解析 B23 短链接
+  let actualUrl = url;
+  try {
+    const response = await axios.get(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      maxRedirects: 0,
+      validateStatus: (status) => status === 302 || status === 301
+    });
+    if (response.headers.location) {
+      actualUrl = response.headers.location;
+    }
+  } catch (e) {}
+
   // 提取 BV 号或 AV 号
-  const bvMatch = url.match(/\/video\/(BV\w+)/);
-  const avMatch = url.match(/\/video\/av(\d+)/);
-  
+  const bvMatch = actualUrl.match(/\/video\/(BV\w+)/);
+  const avMatch = actualUrl.match(/\/video\/av(\d+)/);
+
   if (!bvMatch && !avMatch) {
     throw new Error('无效的 B 站视频 URL');
   }
 
   const videoId = bvMatch ? bvMatch[1] : `av${avMatch[1]}`;
-  
+
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Referer': 'https://www.bilibili.com/',
+  };
+
+  try {
+    // 使用 B站 API 获取更完整的信息
+    const apiUrl = bvMatch
+      ? `https://api.bilibili.com/x/web-interface/view?bvid=${bvMatch[1]}`
+      : `https://api.bilibili.com/x/web-interface/view?aid=${avMatch[1]}`;
+
+    const apiResponse = await axios.get(apiUrl, { headers, timeout: 30000 });
+    const data = apiResponse.data;
+
+    if (data.code !== 0 || !data.data) {
+      // 降级到网页抓取
+      return await analyzeBilibiliFromPage(url, videoId);
+    }
+
+    const info = data.data;
+    const stat = info.stat || {};
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `## 📺 B 站视频分析
+
+**标题:** ${info.title || '未知'}
+
+**UP 主:** ${info.owner?.name || '未知'} (${info.owner?.mid || '未知UID'})
+
+**发布时间:** ${info.pubdate ? new Date(info.pubdate * 1000).toLocaleString('zh-CN') : '未知'}
+
+**播放量:** ${stat.view || 0} | **点赞:** ${stat.like || 0} | **投币:** ${stat.coin || 0} | **收藏:** ${stat.favorite || 0}
+
+**时长:** ${info.duration ? formatDuration(info.duration) : '未知'}
+
+**简介:**
+${info.desc || '无简介'}
+
+**视频 ID:** ${videoId}
+**分P数:** ${info.pages?.length || 1}
+
+${info.pages && info.pages.length > 1 ? '\n**分P列表:**\n' + info.pages.map((p, i) => `  ${i+1}. ${p.part || p.title}`).join('\n') : ''}
+
+---
+
+💡 如需获取完整字幕和语音转文字，请使用 analyze_online_video 工具。`,
+        },
+      ],
+    };
+  } catch (error) {
+    // 降级到网页抓取
+    return await analyzeBilibiliFromPage(url, videoId);
+  }
+}
+
+/**
+ * 从网页抓取 B站视频信息（降级方案）
+ */
+async function analyzeBilibiliFromPage(url, videoId) {
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Referer': 'https://www.bilibili.com/',
@@ -943,13 +1050,13 @@ async function analyzeBilibili(url) {
   try {
     const response = await axios.get(url, { headers, timeout: 30000 });
     const $ = cheerio.load(response.data);
-    
+
     const title = $('h1.video-title').text().trim() || $('[property="og:title"]').attr('content') || '';
     const desc = $('.desc').text().trim() || $('[property="og:description"]').attr('content') || '';
     const owner = $('.up-name').text().trim() || '';
     const view = $('.view').text().trim() || '';
     const pubdate = $('.pubdate').text().trim() || '';
-    
+
     return {
       content: [
         {
@@ -971,13 +1078,72 @@ ${desc || '无简介'}
 
 ---
 
-💡 如需获取完整字幕，请下载视频后使用 extract_subtitles 工具。`,
+💡 如需获取完整字幕和语音转文字，请使用 analyze_online_video 工具。`,
         },
       ],
     };
   } catch (error) {
     throw new Error(`获取视频信息失败：${error.message}`);
   }
+}
+
+/**
+ * 下载在线视频（B站/YouTube等）
+ */
+async function downloadOnlineVideo(url, outputDir = null) {
+  // 检查 yt-dlp 是否安装
+  let hasYtDlp = false;
+  try {
+    await execPromise('yt-dlp --version');
+    hasYtDlp = true;
+  } catch (e) {}
+
+  if (!hasYtDlp) {
+    // 尝试使用 you-get
+    try {
+      await execPromise('you-get --version');
+      // 使用 you-get 下载
+      const tempDir = outputDir || path.join(CACHE_DIR, 'downloads');
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+      const { stdout, stderr } = await execPromise(
+        `you-get -o "${tempDir}" "${url}"`,
+        { timeout: 600000 }
+      );
+      // 查找下载的文件
+      const files = fs.readdirSync(tempDir).filter(f => /\.(mp4|flv|mkv|avi)$/i.test(f));
+      if (files.length > 0) {
+        return path.join(tempDir, files[0]);
+      }
+      throw new Error('未找到下载的视频文件');
+    } catch (e) {
+      throw new Error('需要安装 yt-dlp 或 you-get 来下载在线视频\n安装方法: pip install yt-dlp');
+    }
+  }
+
+  // 使用 yt-dlp 下载
+  const tempDir = outputDir || path.join(CACHE_DIR, 'downloads');
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
+
+  // yt-dlp 下载最佳画质音频+视频
+  await execPromise(
+    `yt-dlp -f "bv+ba/best" --merge-output-format mp4 -o "${tempDir}/%(title)s.%(ext)s" "${url}"`,
+    { timeout: 600000 }
+  );
+
+  // 查找下载的文件
+  const files = fs.readdirSync(tempDir).filter(f => /\.(mp4|flv|mkv|avi|webm)$/i.test(f));
+  if (files.length > 0) {
+    // 返回最新修改的文件
+    const filePaths = files.map(f => path.join(tempDir, f));
+    filePaths.sort((a, b) => fs.statSync(b).mtime - fs.statSync(a).mtime);
+    return filePaths[0];
+  }
+
+  throw new Error('视频下载失败');
 }
 
 /**
@@ -1050,6 +1216,198 @@ ${ytDlpGuide}
       },
     ],
   };
+}
+
+/**
+ * 分析在线视频（支持 B站/YouTube）- 下载后完整分析
+ */
+async function analyzeOnlineVideo(url, options = {}) {
+  const {
+    extract_metadata = true,
+    extract_subtitles = true,
+    video_to_text = false,
+    language = 'zh',
+  } = options;
+
+  const hasFFmpeg = await checkFFmpeg();
+  const whisperInfo = await checkWhisper();
+
+  // 检查 yt-dlp 是否可用
+  let hasYtDlp = false;
+  try {
+    await execPromise('yt-dlp --version');
+    hasYtDlp = true;
+  } catch (e) {}
+
+  // 判断视频平台
+  const isBilibili = url.includes('bilibili.com') || url.includes('b23.tv');
+  const isYouTube = url.includes('youtube.com') || url.includes('youtu.be');
+
+  if (!hasYtDlp) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `## 📺 在线视频分析
+
+**URL:** ${url}
+
+### ⚠️ 需要安装 yt-dlp
+
+yt-dlp 是下载在线视频的最佳工具，支持 B站、YouTube 等平台。
+
+**安装方法:**
+\`\`\`bash
+pip install yt-dlp
+\`\`\`
+
+**安装后功能:**
+1. 下载视频到本地
+2. 提取字幕
+3. 语音转文字
+4. 获取完整元数据`,
+        },
+      ],
+    };
+  }
+
+  try {
+    console.error(`正在分析在线视频: ${url}`);
+
+    // 创建临时下载目录
+    const tempDir = path.join(CACHE_DIR, 'online_video_' + Date.now());
+    fs.mkdirSync(tempDir, { recursive: true });
+
+    // 下载视频
+    console.error('正在下载视频...');
+    const localPath = await downloadOnlineVideo(url, tempDir);
+    console.error(`视频已下载: ${localPath}`);
+
+    // 构建分析结果
+    let result = {
+      url: url,
+      local_path: localPath,
+      file: path.basename(localPath),
+      size: formatFileSize(fs.statSync(localPath).size),
+    };
+
+    // 并行执行分析任务
+    const tasks = [];
+
+    if (extract_metadata && hasFFmpeg) {
+      tasks.push(
+        getVideoMetadata(localPath)
+          .then(m => { result.metadata = m; })
+          .catch(e => { result.metadata_error = e.message; })
+      );
+    }
+
+    if (extract_subtitles && hasFFmpeg) {
+      tasks.push(
+        extractSubtitlesFromFile(localPath)
+          .then(s => { result.subtitles = s; })
+          .catch(e => { result.subtitles_error = e.message; })
+      );
+    }
+
+    if (video_to_text && whisperInfo.available) {
+      tasks.push(
+        videoToText(localPath, language, 'base', true)
+          .then(r => {
+            // 提取文本内容
+            if (r.content && r.content[0] && r.content[0].text) {
+              const text = r.content[0].text;
+              const match = text.match(/\*\*识别长度:\*\* (\d+)/);
+              result.transcript_length = match ? parseInt(match[1]) : 0;
+              result.transcript_preview = text.substring(0, 2000);
+            }
+          })
+          .catch(e => { result.transcript_error = e.message; })
+      );
+    }
+
+    await Promise.all(tasks);
+
+    // 清理临时文件
+    try {
+      const files = fs.readdirSync(tempDir);
+      files.forEach(f => {
+        try { fs.unlinkSync(path.join(tempDir, f)); } catch (e) {}
+      });
+      fs.rmdirSync(tempDir);
+    } catch (e) {}
+
+    // 格式化输出
+    let output = `## 📺 在线视频分析
+
+**来源:** ${isBilibili ? 'B站' : isYouTube ? 'YouTube' : '在线视频'}
+**原始URL:** ${url}
+**本地文件:** ${result.file}
+**文件大小:** ${result.size}
+
+`;
+
+    if (result.metadata) {
+      output += `
+### 📊 元数据
+
+**时长:** ${result.metadata.duration}
+**比特率:** ${result.metadata.bitrate}
+`;
+      if (result.metadata.video) {
+        output += `**视频:** ${result.metadata.video.codec} | ${result.metadata.video.resolution} | ${result.metadata.video.fps}`;
+      }
+      if (result.metadata.audio) {
+        output += `\n**音频:** ${result.metadata.audio.codec} | ${result.metadata.audio.sample_rate}`;
+      }
+      output += '\n';
+    }
+
+    if (result.subtitles && result.subtitles !== '未找到内嵌字幕流') {
+      output += `
+### 📝 字幕内容
+
+${result.subtitles.substring(0, 1500)}${result.subtitles.length > 1500 ? '...' : ''}
+`;
+    }
+
+    if (result.transcript_preview) {
+      output += `
+### 🎤 语音转文字
+
+${result.transcript_preview}
+`;
+    }
+
+    if (result.subtitles_error && result.transcript_error) {
+      output += `
+### ⚠️ 说明
+
+该视频可能没有内嵌字幕，且语音转文字未能自动进行。
+建议:
+1. 使用 video_to_text 工具手动转写
+2. 视频可能需要特殊处理`;
+    }
+
+    return {
+      content: [{ type: 'text', text: output }],
+    };
+  } catch (error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `❌ 在线视频分析失败：${error.message}
+
+请确保:
+1. yt-dlp 已安装: pip install yt-dlp
+2. 视频链接可访问
+3. 网络连接正常`,
+        },
+      ],
+      isError: true,
+    };
+  }
 }
 
 // 辅助函数：格式化文件大小
