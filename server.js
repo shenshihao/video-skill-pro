@@ -954,7 +954,7 @@ async function extractAudio(videoPath, outputPath = null, format = 'mp3') {
 }
 
 /**
- * 分析 B 站视频
+ * 分析 B 站视频（完整版 - 不下载）
  */
 async function analyzeBilibili(url, includeDanmaku = false) {
   // 解析 B23 短链接
@@ -978,7 +978,9 @@ async function analyzeBilibili(url, includeDanmaku = false) {
     throw new Error('无效的 B 站视频 URL');
   }
 
-  const videoId = bvMatch ? bvMatch[1] : `av${avMatch[1]}`;
+  const bvid = bvMatch ? bvMatch[1] : null;
+  const aid = avMatch ? parseInt(avMatch[1]) : null;
+  const videoId = bvid || `av${aid}`;
 
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -986,27 +988,85 @@ async function analyzeBilibili(url, includeDanmaku = false) {
   };
 
   try {
-    // 使用 B站 API 获取更完整的信息
-    const apiUrl = bvMatch
-      ? `https://api.bilibili.com/x/web-interface/view?bvid=${bvMatch[1]}`
-      : `https://api.bilibili.com/x/web-interface/view?aid=${avMatch[1]}`;
+    // 1. 获取视频基本信息
+    const apiUrl = bvid
+      ? `https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`
+      : `https://api.bilibili.com/x/web-interface/view?aid=${aid}`;
 
     const apiResponse = await axios.get(apiUrl, { headers, timeout: 30000 });
     const data = apiResponse.data;
 
     if (data.code !== 0 || !data.data) {
-      // 降级到网页抓取
       return await analyzeBilibiliFromPage(url, videoId);
     }
 
     const info = data.data;
     const stat = info.stat || {};
 
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `## 📺 B 站视频分析
+    // 2. 获取字幕信息
+    let subtitles = [];
+    let subtitleContent = '';
+    try {
+      const subtitleApiUrl = `https://api.bilibili.com/x/player/v2?bvid=${bvid}&aid=${aid}`;
+      const subtitleResponse = await axios.get(subtitleApiUrl, { headers, timeout: 30000 });
+      const subtitleData = subtitleResponse.data;
+
+      if (subtitleData.data && subtitleData.data.subtitle) {
+        subtitles = subtitleData.data.subtitle.subtitles || [];
+
+        // 获取字幕实际内容
+        for (const sub of subtitles) {
+          if (sub.subtitle_url) {
+            try {
+              const subContent = await axios.get(sub.subtitle_url, { timeout: 30000 });
+              const subBody = subContent.data;
+              // 解析 ASS/SSA 字幕格式
+              if (subBody.events) {
+                // ASS 格式
+                const lines = subBody.events
+                  .filter(e => e.Text)
+                  .map(e => e.Text.replace(/\\N/g, '\n').replace(/\{[^}]*\}/g, ''))
+                  .join('\n');
+                sub.content = lines;
+              } else if (Array.isArray(subBody)) {
+                // JSON 格式
+                sub.content = subBody.map(s => s.content).join('\n');
+              }
+            } catch (e) {
+              sub.content = '（无法获取字幕内容）';
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('获取字幕失败:', e.message);
+    }
+
+    // 3. 获取弹幕列表
+    let danmakuList = [];
+    if (includeDanmaku && aid) {
+      try {
+        const danmakuUrl = `https://api.bilibili.com/x/v1/dm/list.so?oid=${info.cid}`;
+        const danmakuResponse = await axios.get(danmakuUrl, {
+          headers: { ...headers, 'Accept': 'application/xml' },
+          timeout: 30000
+        });
+        // 解析 XML 弹幕
+        const danmakuText = danmakuResponse.data;
+        const matches = danmakuText.matchAll(/<d[^>]*>([^<]+)<\/d>/g);
+        let count = 0;
+        for (const m of matches) {
+          danmakuList.push(m[1]);
+          count++;
+          if (count >= 100) break; // 限制返回100条
+        }
+      } catch (e) {
+        console.error('获取弹幕失败:', e.message);
+      }
+    }
+
+    // 4. 构建完整输出
+    let output = `## 📺 B 站视频分析
 
 **标题:** ${info.title || '未知'}
 
@@ -1025,15 +1085,35 @@ ${info.desc || '无简介'}
 **分P数:** ${info.pages?.length || 1}
 
 ${info.pages && info.pages.length > 1 ? '\n**分P列表:**\n' + info.pages.map((p, i) => `  ${i+1}. ${p.part || p.title}`).join('\n') : ''}
+`;
 
----
+    // 添加字幕信息
+    if (subtitles.length > 0) {
+      output += `\n**字幕列表:** ${subtitles.length} 个\n`;
+      for (const sub of subtitles) {
+        output += `\n### 📝 ${sub.lan_doc || sub.lan || '字幕'} ${sub.content ? `(${sub.content.length}字符)` : ''}`;
+        if (sub.content) {
+          output += `\n${sub.content.substring(0, 2000)}${sub.content.length > 2000 ? '...' : ''}`;
+        }
+      }
+    } else {
+      output += `\n**字幕:** 无内嵌字幕`;
+    }
 
-💡 如需获取完整字幕和语音转文字，请使用 analyze_online_video 工具。`,
-        },
-      ],
+    // 添加弹幕信息
+    if (danmakuList.length > 0) {
+      output += `\n\n**弹幕预览 (前100条):**\n`;
+      danmakuList.slice(0, 50).forEach(d => {
+        output += `• ${d}\n`;
+      });
+    }
+
+    output += `\n---\n💡 如需完整语音转文字，请使用 video_to_text 工具下载后分析。`;
+
+    return {
+      content: [{ type: 'text', text: output }],
     };
   } catch (error) {
-    // 降级到网页抓取
     return await analyzeBilibiliFromPage(url, videoId);
   }
 }
